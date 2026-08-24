@@ -1,8 +1,10 @@
-use rand::Rng;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod matrix;
+
+use matrix::{random_matrices, random_matrix};
 
 type BlasInt = i32;
 
@@ -33,15 +35,6 @@ unsafe extern "C" {
         c: *mut f64,
         ldc: BlasInt,
     );
-}
-
-fn random_matrix(n: usize) -> Vec<f64> {
-    let mut rng = rand::thread_rng();
-    (0..n * n).map(|_| rng.r#gen::<f64>()).collect()
-}
-
-fn random_matrices(n: usize, count: usize) -> Vec<Vec<f64>> {
-    (0..count).map(|_| random_matrix(n)).collect()
 }
 
 fn matmul(n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
@@ -80,47 +73,44 @@ fn bench_blas_threads(n: usize, count: usize, blas_threads: i32, fixed: &[f64]) 
     start.elapsed()
 }
 
-/// Multiplies `fixed` by `count` random n x n matrices using `rust_threads` worker threads,
-/// each pinned to single-threaded OpenBLAS and receiving matrices through a channel.
+/// Multiplies `fixed` by `count` random n x n matrices split as evenly as possible across
+/// `rust_threads` worker threads, each pinned to single-threaded OpenBLAS.
 fn bench_rust_threads(n: usize, count: usize, rust_threads: usize, fixed: &[f64]) -> Duration {
     unsafe { openblas_set_num_threads(1) };
-    let matrices = random_matrices(n, count);
+    let matrices = Arc::new(random_matrices(n, count));
     let fixed = Arc::new(fixed.to_vec());
     let worker_count = rust_threads.min(count.max(1));
 
+    // First `remainder` workers take one extra matrix so sizes differ by at most 1.
+    let base = count / worker_count;
+    let remainder = count % worker_count;
+
     let start = Instant::now();
     thread::scope(|scope| {
-        let channels: Vec<(Sender<Vec<f64>>, Receiver<Vec<f64>>)> =
-            (0..worker_count).map(|_| mpsc::channel()).collect();
-        let (senders, receivers): (Vec<_>, Vec<_>) = channels.into_iter().unzip();
+        let mut offset = 0;
+        for worker in 0..worker_count {
+            let len = base + usize::from(worker < remainder);
+            let range = offset..offset + len;
+            offset += len;
 
-        for receiver in receivers {
             let fixed = Arc::clone(&fixed);
+            let matrices = Arc::clone(&matrices);
             scope.spawn(move || {
                 unsafe { openblas_set_num_threads(1) };
                 let mut c = vec![0.0f64; n * n];
-                for matrix in receiver {
-                    matmul(n, &fixed, &matrix, &mut c);
+                for m in &matrices[range] {
+                    matmul(n, &fixed, m, &mut c);
                 }
             });
         }
-
-        for (index, matrix) in matrices.into_iter().enumerate() {
-            let sender = &senders[index % worker_count];
-            sender
-                .send(matrix)
-                .expect("worker thread unexpectedly stopped");
-        }
-
-        drop(senders);
     });
     start.elapsed()
 }
 
 fn main() {
     let config = BenchmarkConfig {
-        matrix_size: 512,
-        multiplication_count: 128,
+        matrix_size: 2048,
+        multiplication_count: 256,
         thread_counts: &[1, 2, 4, 8],
     };
     let fixed = random_matrix(config.matrix_size);
